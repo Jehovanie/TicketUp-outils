@@ -1,0 +1,94 @@
+services:
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    container_name: minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      # URL publique de l'API S3 (utile derriere un reverse proxy)
+      MINIO_SERVER_URL: ${MINIO_SERVER_URL:-http://localhost:9000}
+      MINIO_BROWSER_REDIRECT_URL: ${MINIO_CONSOLE_URL:-http://localhost:9001}
+    ports:
+      - "${MINIO_API_PORT:-9000}:9000"   # API S3
+      - "${MINIO_CONSOLE_PORT:-9001}:9001" # Console web
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - minio_net
+
+  # Job d'initialisation : cree le bucket + un utilisateur applicatif dedie
+  minio-init:
+    image: minio/mc:RELEASE.2025-04-16T18-13-26Z
+    container_name: minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      APP_BUCKET: ${APP_BUCKET:-user-files}
+      APP_ACCESS_KEY: ${APP_ACCESS_KEY:-app-access-key}
+      APP_SECRET_KEY: ${APP_SECRET_KEY:-app-secret-key}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        mc alias set local http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD"
+
+        # Bucket des fichiers utilisateurs (prive par defaut)
+        mc mb --ignore-existing "local/$$APP_BUCKET"
+        mc anonymous set none "local/$$APP_BUCKET"
+
+        # Versioning : permet de recuperer un fichier ecrase ou supprime
+        mc version enable "local/$$APP_BUCKET"
+
+        # Cycle de vie : purge des versions non-courantes apres 7 jours
+        mc ilm rule add --noncurrent-expire-days 7 "local/$$APP_BUCKET" || true
+
+        # Utilisateur applicatif limite a ce seul bucket
+        mc admin user add local "$$APP_ACCESS_KEY" "$$APP_SECRET_KEY" || true
+        cat > /tmp/policy.json <<POLICY
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Action": ["s3:ListBucket", "s3:GetBucketLocation"],
+              "Resource": ["arn:aws:s3:::$$APP_BUCKET"]
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "s3:PutObject",
+                "s3:GetObject",
+                "s3:DeleteObject",
+                "s3:AbortMultipartUpload",
+                "s3:ListMultipartUploadParts"
+              ],
+              "Resource": ["arn:aws:s3:::$$APP_BUCKET/*"]
+            }
+          ]
+        }
+        POLICY
+        mc admin policy create local app-rw /tmp/policy.json || true
+        mc admin policy attach local app-rw --user "$$APP_ACCESS_KEY" || true
+
+        echo "MinIO initialise : bucket=$$APP_BUCKET"
+    networks:
+      - minio_net
+
+volumes:
+  minio_data:
+    driver: local
+
+networks:
+  minio_net:
+    driver: bridge
